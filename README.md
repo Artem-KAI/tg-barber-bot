@@ -26,12 +26,6 @@
 
 1. Токен от [@BotFather](https://t.me/BotFather)
 2. Свой Telegram ID, например через [@userinfobot](https://t.me/userinfobot)
-3. Значения в `.env`:
-
-```env
-BOT_TOKEN=123456789:AA...ваш_токен
-ADMIN_ID=123456789
-```
 
 ## Запуск
 
