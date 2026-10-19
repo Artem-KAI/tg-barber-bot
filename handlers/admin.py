@@ -1,293 +1,349 @@
+"""Admin panel handler."""
+from __future__ import annotations
+
+import logging
+from html import escape
+
 from aiogram import F, Router
-from aiogram.filters import StateFilter
+from aiogram.enums import ParseMode
+from aiogram.filters import Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from config import SEGMENTS
-from db import Database
-from formatters import STATUS_RU, barber_card, booking_card, segment_title
-from keyboards import admin_barber_actions, admin_keyboard, bookings_keyboard, segments_keyboard, services_keyboard
-from states import AdminEditFSM
-from utils import menu_markup, parse_rating, parse_usd, safe_send
+from app.config import settings
+from app.db import db
+from app.formatters import format_barber_profile, format_booking_card, format_service_list
+from app.keyboards import (
+    admin_barber_actions_kb,
+    admin_barber_list_kb,
+    admin_bookings_kb,
+    admin_panel_kb,
+    admin_services_kb,
+    cancel_kb,
+)
+from app.states import AdminFSM
+from app.texts import BTN, MSG
+from app.utils import (
+    delete_message_safe,
+    is_admin,
+    parse_price,
+    parse_rating,
+    row_to_dict,
+    safe_answer,
+    send_main_menu,
+    send_menu_message,
+    text_is,
+    NOT_TYPING,
+)
 
-router = Router()
+__all__ = ["router"]
+
+logger = logging.getLogger(__name__)
+router = Router(name="admin")
 
 
-def require_admin(user_id: int | None, admin_id: int) -> bool:
-    return user_id == admin_id
+# ── Admin filter ──────────────────────────────────────────────────────────────
+
+class AdminFilter(Filter):
+    """Only allow the configured admin user."""
+
+    async def __call__(self, event: Message | CallbackQuery) -> bool:  # type: ignore[override]
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return False
+        return is_admin(user.id)
 
 
-@router.message(F.text == "Админ-панель", StateFilter(None))
-async def admin_home(message: Message, admin_id: int) -> None:
-    if not require_admin(message.from_user.id if message.from_user else None, admin_id):
-        await message.answer("Эта панель только для администратора.")
-        return
-    await message.answer(
-        "Админ-панель: одобрение барберов, записи, рейтинги и цены студии.",
-        reply_markup=admin_keyboard(),
+router.message.filter(AdminFilter())
+router.callback_query.filter(AdminFilter())
+
+
+# ── Admin panel entry ─────────────────────────────────────────────────────────
+
+@router.message(text_is(BTN["admin_panel"], "admin panel", "admin"), NOT_TYPING)
+async def admin_panel_entry(message: Message, state: FSMContext) -> None:
+    """Show admin panel main menu, deleting any previous menu message above."""
+    await state.clear()
+    await send_menu_message(
+        message,
+        state,
+        MSG["admin_panel"],
+        reply_markup=admin_panel_kb(),
     )
 
 
-@router.callback_query(F.data == "adm:pending")
-async def admin_pending(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    pending = db.list_barbers("pending")
-    if not callback.message:
-        await callback.answer()
-        return
+@router.callback_query(F.data == "admin:panel")
+async def admin_panel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    """Return to admin panel, deleting previous menu message."""
+    await safe_answer(callback)
+    await send_menu_message(
+        callback,
+        state,
+        MSG["admin_panel"],
+        reply_markup=admin_panel_kb(),
+    )
+
+
+# ── Pending Applications ──────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:pending")
+async def admin_pending(callback: CallbackQuery, state: FSMContext) -> None:
+    """Show list of pending barber applications, deleting the menu message above."""
+    await safe_answer(callback)
+    await delete_message_safe(callback.message)
+    pending = await db.get_pending_barbers()
     if not pending:
-        await callback.message.answer("Нет заявок барберов.")
-        await callback.answer()
+        await send_main_menu(callback, state, text=MSG["admin_no_pending"])
         return
-    rows = [
-        [InlineKeyboardButton(text=item["name"], callback_data=f"ashow:{item['user_id']}")]
-        for item in pending
-    ]
-    await callback.message.answer(
-        "Заявки на регистрацию:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
+    for barber in pending:
+        card = format_barber_profile(row_to_dict(barber))
+        username = barber["username"] or "—"
+        header = f"<b>Application:</b> @{username}\n\n{card}"
+        await callback.message.answer(  # type: ignore[union-attr]
+            header,
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_barber_actions_kb(barber["user_id"], barber["status"]),
+        )
 
 
-@router.callback_query(F.data == "adm:barbers")
-async def admin_barbers(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
+@router.callback_query(F.data.startswith("admin_approve:"))
+async def admin_approve_barber(callback: CallbackQuery, state: FSMContext) -> None:
+    """Approve a barber application."""
+    barber_user_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    barber = await db.get_barber(barber_user_id)
+    if not barber or barber["status"] != "pending":
+        await safe_answer(callback, MSG["stale_button"], show_alert=True)
+        await delete_message_safe(callback.message)
         return
-    barbers = db.list_barbers()
-    if not callback.message:
-        await callback.answer()
+    await safe_answer(callback)
+    await db.approve_barber(barber_user_id)
+    try:
+        await callback.bot.send_message(  # type: ignore[union-attr]
+            chat_id=barber_user_id,
+            text=MSG["notify_barber_approved"],
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Could not notify barber %s: %s", barber_user_id, e)
+    await send_main_menu(callback, state, text=MSG["admin_approved_ok"])
+
+
+@router.callback_query(F.data.startswith("admin_reject:"))
+async def admin_reject_barber(callback: CallbackQuery, state: FSMContext) -> None:
+    """Reject a barber application."""
+    barber_user_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    barber = await db.get_barber(barber_user_id)
+    if not barber or barber["status"] != "pending":
+        await safe_answer(callback, MSG["stale_button"], show_alert=True)
+        await delete_message_safe(callback.message)
         return
+    await safe_answer(callback)
+    await db.reject_barber(barber_user_id)
+    try:
+        await callback.bot.send_message(  # type: ignore[union-attr]
+            chat_id=barber_user_id,
+            text=MSG["notify_barber_rejected"],
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Could not notify barber %s: %s", barber_user_id, e)
+    await send_main_menu(callback, state, text=MSG["admin_rejected_ok"])
+
+
+# ── All Barbers ───────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:barbers")
+async def admin_all_barbers(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    barbers = await db.get_all_barbers()
     if not barbers:
-        await callback.message.answer("Барберов пока нет.")
-        await callback.answer()
+        await send_main_menu(callback, state, text=MSG["admin_no_barbers"])
         return
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=f"{item['name']} · {STATUS_RU.get(item['status'], item['status'])}",
-                callback_data=f"ashow:{item['user_id']}",
-            )
-        ]
-        for item in barbers
-    ]
-    await callback.message.answer("Все барберы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await callback.answer()
+    await send_menu_message(
+        callback,
+        state,
+        "<b>All Barbers:</b>",
+        reply_markup=admin_barber_list_kb(barbers),
+    )
 
 
-@router.callback_query(F.data.startswith("ashow:"))
-async def admin_show_barber(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if not callback.data or not callback.message:
-        await callback.answer()
-        return
-    user_id = int(callback.data.split(":")[1])
-    barber = db.get_barber(user_id)
+@router.callback_query(F.data.startswith("admin_barber:"))
+async def admin_view_barber(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    barber_user_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    barber = await db.get_barber(barber_user_id)
     if not barber:
-        await callback.answer("Не найден", show_alert=True)
+        await send_main_menu(callback, state, text=MSG["error"])
         return
-    await callback.message.answer(
-        barber_card(barber) + f"\nСтатус: {STATUS_RU.get(barber['status'], barber['status'])}\nID: {user_id}",
-        reply_markup=admin_barber_actions(user_id, barber["status"]),
+    card = format_barber_profile(row_to_dict(barber))
+    await send_menu_message(
+        callback,
+        state,
+        card,
+        reply_markup=admin_barber_actions_kb(
+            barber_user_id, barber["status"], back_cb="admin:barbers"
+        ),
     )
-    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("aap:"))
-async def admin_approve(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    await set_status(callback, db, admin_id, "approved", "Вас одобрили как барбера. Откройте «Кабинет барбера».")
+# ── All Bookings ──────────────────────────────────────────────────────────────
 
-
-@router.callback_query(F.data.startswith("arj:"))
-async def admin_reject(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    await set_status(callback, db, admin_id, "rejected", "Заявка барбера отклонена.")
-
-
-@router.callback_query(F.data.startswith("abl:"))
-async def admin_block(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    await set_status(callback, db, admin_id, "blocked", "Ваш аккаунт барбера заблокирован.")
-
-
-async def set_status(
-    callback: CallbackQuery,
-    db: Database,
-    admin_id: int,
-    status: str,
-    user_text: str,
-) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
+@router.callback_query(F.data == "admin:bookings")
+async def admin_all_bookings(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    bookings = await db.get_all_bookings()
+    if not bookings:
+        await send_main_menu(callback, state, text=MSG["admin_no_bookings"])
         return
-    if not callback.data:
-        await callback.answer()
-        return
-    user_id = int(callback.data.split(":")[1])
-    db.set_barber_status(user_id, status)
-    await safe_send(callback.bot, user_id, user_text)
-    if callback.message:
-        await callback.message.answer(f"Статус барбера {user_id}: {STATUS_RU.get(status, status)}")
-    await callback.answer("Готово")
+    await send_menu_message(
+        callback,
+        state,
+        "<b>All Bookings</b> (last 20):",
+        reply_markup=admin_bookings_kb(bookings),
+    )
 
 
-@router.callback_query(F.data.startswith("aed:"))
-async def admin_edit_barber(callback: CallbackQuery, state: FSMContext, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if not callback.data or not callback.message:
-        await callback.answer()
-        return
-    _, user_id_raw, field = callback.data.split(":")
-    user_id = int(user_id_raw)
-    await state.update_data(target_barber_id=user_id)
-    if field == "name":
-        await state.set_state(AdminEditFSM.barber_name)
-        await callback.message.answer("Новое имя барбера:")
-    elif field == "rating":
-        await state.set_state(AdminEditFSM.barber_rating)
-        await callback.message.answer("Новый рейтинг от 1.0 до 5.0:")
-    elif field == "seg":
-        await state.set_state(AdminEditFSM.barber_segment)
-        await callback.message.answer(
-            "Выберите сегмент:",
-            reply_markup=segments_keyboard("adseg"),
-        )
-    await callback.answer()
-
-
-@router.message(AdminEditFSM.barber_name)
-async def admin_save_name(message: Message, state: FSMContext, db: Database, admin_id: int) -> None:
-    if not require_admin(message.from_user.id if message.from_user else None, admin_id):
-        return
-    name = (message.text or "").strip()
-    data = await state.get_data()
-    db.update_barber(int(data["target_barber_id"]), name=name)
-    await state.clear()
-    await message.answer("Имя барбера обновлено.", reply_markup=await menu_markup(message, db, admin_id))
-
-
-@router.message(AdminEditFSM.barber_rating)
-async def admin_save_rating(message: Message, state: FSMContext, db: Database, admin_id: int) -> None:
-    if not require_admin(message.from_user.id if message.from_user else None, admin_id):
-        return
-    rating = parse_rating(message.text or "")
-    if rating is None:
-        await message.answer("Введите число от 1 до 5.")
-        return
-    data = await state.get_data()
-    db.update_barber(int(data["target_barber_id"]), rating=rating)
-    await state.clear()
-    await message.answer(f"Рейтинг обновлён: {rating:.1f}", reply_markup=await menu_markup(message, db, admin_id))
-
-
-@router.callback_query(AdminEditFSM.barber_segment, F.data.startswith("adseg:"))
-async def admin_save_segment(callback: CallbackQuery, state: FSMContext, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if not callback.data:
-        await callback.answer()
-        return
-    segment = callback.data.split(":")[1]
-    if segment not in SEGMENTS:
-        await callback.answer("Неизвестный сегмент", show_alert=True)
-        return
-    data = await state.get_data()
-    db.update_barber(int(data["target_barber_id"]), segment=segment)
-    await state.clear()
-    spec = SEGMENTS[segment]
-    if callback.message:
-        await callback.message.answer(
-            f"Сегмент: {segment_title(segment)} ${spec['price_min']}–${spec['price_max']}",
-            reply_markup=await menu_markup(callback, db, admin_id),
-        )
-    await callback.answer("Сохранено")
-
-
-@router.callback_query(F.data == "adm:bookings")
-async def admin_bookings(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    items = db.all_bookings()
-    if not callback.message:
-        await callback.answer()
-        return
-    if not items:
-        await callback.message.answer("Заявок пока нет.")
-        await callback.answer()
-        return
-    await callback.message.answer("Все заявки:", reply_markup=bookings_keyboard(items, "abk"))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("abk:"))
-async def admin_open_booking(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if not callback.data or not callback.message:
-        await callback.answer()
-        return
-    booking = db.get_booking(int(callback.data.split(":")[1]))
+@router.callback_query(F.data.startswith("admin_bk:"))
+async def admin_view_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    booking_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    booking = await db.get_booking(booking_id)
     if not booking:
-        await callback.answer("Не найдена", show_alert=True)
+        await send_main_menu(callback, state, text=MSG["error"])
         return
-    await callback.message.answer(booking_card(booking))
-    await callback.answer()
+    barber = await db.get_barber(booking["barber_id"])
+    barber_name = barber["name"] if barber else "—"
+    card = format_booking_card({**row_to_dict(booking), "barber_name": barber_name})
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=BTN["back"], callback_data="admin:bookings")
+    ]])
+    await send_menu_message(callback, state, card, reply_markup=back_kb)
 
 
-@router.callback_query(F.data == "adm:services")
-async def admin_services(callback: CallbackQuery, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if not callback.message:
-        await callback.answer()
-        return
-    await callback.message.answer(
-        "Базовые цены студии. Нажмите услугу, чтобы изменить цену в долларах:",
-        reply_markup=services_keyboard(db.get_services(), prefix="apr"),
+# ── Studio Service Prices ─────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:prices")
+async def admin_prices(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    services = await db.get_services()
+    service_list = format_service_list(services)
+    await send_menu_message(
+        callback,
+        state,
+        MSG["admin_service_list"].format(list=service_list),
+        reply_markup=admin_services_kb(services),
     )
-    await callback.answer()
 
 
-@router.callback_query(F.data.startswith("apr:"))
-async def admin_ask_service_price(callback: CallbackQuery, state: FSMContext, db: Database, admin_id: int) -> None:
-    if not require_admin(callback.from_user.id if callback.from_user else None, admin_id):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if not callback.data or not callback.message:
-        await callback.answer()
-        return
-    service_id = int(callback.data.split(":")[1])
-    service = db.get_service(service_id)
-    if not service:
-        await callback.answer("Не найдена", show_alert=True)
-        return
-    await state.set_state(AdminEditFSM.service_price)
-    await state.update_data(service_id=service_id)
-    await callback.message.answer(f"Новая базовая цена для «{service['title']}» в $:")
-    await callback.answer()
+@router.callback_query(F.data.startswith("admin_svc:"))
+async def admin_edit_price_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    _, svc_id_str, svc_name = callback.data.split(":", 2)  # type: ignore[union-attr]
+    svc_id = int(svc_id_str)
+    await state.set_state(AdminFSM.set_service_price)
+    await state.update_data(editing_service_id=svc_id, editing_service_name=svc_name)
+    await delete_message_safe(callback.message)
+    await callback.message.answer(  # type: ignore[union-attr]
+        MSG["admin_enter_price"].format(service=escape(svc_name)),
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb(),
+    )
 
 
-@router.message(AdminEditFSM.service_price)
-async def admin_save_service_price(message: Message, state: FSMContext, db: Database, admin_id: int) -> None:
-    if not require_admin(message.from_user.id if message.from_user else None, admin_id):
-        return
-    price = parse_usd(message.text or "")
+@router.message(AdminFSM.set_service_price)
+async def admin_edit_price_done(message: Message, state: FSMContext) -> None:
+    price = parse_price(message)
     if price is None:
-        await message.answer("Введите сумму в долларах.")
+        await message.answer(MSG["invalid_price"])
         return
     data = await state.get_data()
-    db.update_service_price(int(data["service_id"]), price)
-    await state.clear()
-    await message.answer(
-        f"Базовая цена обновлена: ${price}. Новые барберы будут получать её по умолчанию.",
-        reply_markup=await menu_markup(message, db, admin_id),
+    await db.update_service_price(data["editing_service_id"], price)
+    await send_main_menu(
+        message,
+        state,
+        text=MSG["admin_price_updated"].format(
+            service=escape(data["editing_service_name"]), price=f"{price:.0f}"
+        ),
     )
+
+
+# ── Barber rating & removal ───────────────────────────────────────────────────
+
+async def _approved_barber(callback: CallbackQuery):
+    """Barber from callback data if still approved, else answer with an alert."""
+    barber_user_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    barber = await db.get_barber(barber_user_id)
+    if not barber or barber["status"] != "approved":
+        await safe_answer(callback, MSG["stale_button"], show_alert=True)
+        await delete_message_safe(callback.message)
+        return None
+    return barber
+
+
+@router.callback_query(F.data.startswith("admin_rating:"))
+async def admin_rating_start(callback: CallbackQuery, state: FSMContext) -> None:
+    barber = await _approved_barber(callback)
+    if not barber:
+        return
+    await safe_answer(callback)
+    await state.set_state(AdminFSM.set_rating)
+    await state.update_data(rating_barber_id=barber["user_id"])
+    await delete_message_safe(callback.message)
+    await callback.message.answer(  # type: ignore[union-attr]
+        MSG["admin_enter_rating"].format(name=escape(barber["name"])),
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(AdminFSM.set_rating)
+async def admin_rating_done(message: Message, state: FSMContext) -> None:
+    rating = parse_rating(message)
+    if rating is None:
+        await message.answer(MSG["invalid_rating"])
+        return
+    data = await state.get_data()
+    await db.update_barber_field(data["rating_barber_id"], "rating", rating)
+    await send_main_menu(message, state, text=MSG["admin_rating_updated"])
+
+
+@router.callback_query(F.data.startswith("admin_remove:"))
+async def admin_remove_prompt(callback: CallbackQuery, state: FSMContext) -> None:
+    barber = await _approved_barber(callback)
+    if not barber:
+        return
+    if barber["user_id"] == settings.admin_id:
+        # The admin's own barber record is recreated on every /start
+        await safe_answer(callback, MSG["admin_cannot_remove_self"], show_alert=True)
+        return
+    await safe_answer(callback)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=BTN["admin_remove_yes"], callback_data=f"admin_remove_yes:{barber['user_id']}"),
+        InlineKeyboardButton(text=BTN["back"], callback_data=f"admin_barber:{barber['user_id']}"),
+    ]])
+    await send_menu_message(
+        callback, state, MSG["admin_remove_confirm"].format(name=escape(barber["name"])), reply_markup=kb
+    )
+
+
+@router.callback_query(F.data.startswith("admin_remove_yes:"))
+async def admin_remove_confirmed(callback: CallbackQuery, state: FSMContext) -> None:
+    barber = await _approved_barber(callback)
+    if not barber or barber["user_id"] == settings.admin_id:
+        return
+    await safe_answer(callback)
+    barber_id = barber["user_id"]
+    for bk in await db.cancel_active_barber_bookings(barber_id):
+        try:
+            await callback.bot.send_message(  # type: ignore[union-attr]
+                chat_id=bk["client_id"],
+                text=MSG["notify_client_barber_left"].format(id=bk["id"]),
+            )
+        except Exception as e:
+            logger.warning("Could not notify client %s: %s", bk["client_id"], e)
+    await db.delete_barber(barber_id)
+    try:
+        await callback.bot.send_message(chat_id=barber_id, text=MSG["notify_barber_removed"])  # type: ignore[union-attr]
+    except Exception as e:
+        logger.warning("Could not notify barber %s: %s", barber_id, e)
+    await send_main_menu(callback, state, text=MSG["admin_removed_ok"])

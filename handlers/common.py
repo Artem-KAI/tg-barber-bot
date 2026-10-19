@@ -1,61 +1,123 @@
-from aiogram import F, Router
-from aiogram.filters import Command, CommandStart, StateFilter
+"""Common handlers: /start, cancel, location, fallback."""
+from __future__ import annotations
+
+import logging
+
+from aiogram import Router
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
-from db import Database
-from keyboards import main_keyboard
-from utils import cancel_flow
+from app.db import db
+from app.keyboards import location_kb, main_menu_kb
+from app.texts import BTN, MSG, SHOP_ADDRESS, SHOP_HOURS, SHOP_NAME
+from app.utils import (
+    delete_previous_menu,
+    get_barber_status,
+    is_admin,
+    safe_answer,
+    send_main_menu,
+    send_menu_message,
+    text_is,
+    NOT_TYPING,
+)
 
-router = Router()
-fallback_router = Router()
+__all__ = ["router", "fallback_router"]
+
+logger = logging.getLogger(__name__)
+router = Router(name="common")
+fallback_router = Router(name="fallback")
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, db: Database, admin_id: int) -> None:
+# ── /start ────────────────────────────────────────────────────────────────────
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    """Handle /start — register user and show the initial welcome message with main menu."""
+    await delete_previous_menu(message, state)
     await state.clear()
-    user_id = message.from_user.id if message.from_user else 0
+    user = message.from_user
+    if user is None:
+        return
+    await db.ensure_user(user.id, user.username, user.full_name)
+    if is_admin(user.id):
+        await db.ensure_admin_barber(user.id)
+
+    uid = user.id
+    barber_status = await get_barber_status(uid)
+    admin = is_admin(uid)
     await message.answer(
-        "Добро пожаловать в барбер-студию.\n\n"
-        "Можно записаться к мастеру, выбрать услугу и ценовой сегмент в долларах, "
-        "а также отредактировать заявку до подтверждения.\n\n"
-        "Хотите принимать клиентов — оставьте заявку «Стать барбером».",
-        reply_markup=main_keyboard(user_id, admin_id, db),
+        MSG["welcome"].format(shop=SHOP_NAME),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_kb(is_admin=admin, barber_status=barber_status),
     )
 
+
+# ── Cancel ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("cancel"))
-@router.message(F.text.casefold() == "отмена")
-async def cmd_cancel(message: Message, state: FSMContext, db: Database, admin_id: int) -> None:
-    await cancel_flow(message, state, db, admin_id)
+@router.message(text_is(BTN["cancel"], "cancel", "отмена"))
+async def handle_cancel(message: Message, state: FSMContext) -> None:
+    """Cancel any active FSM state and return to main menu without re-sending the long welcome text."""
+    await send_main_menu(message, state, text=MSG["cancelled"])
 
 
-@router.message(F.text == "Статус заявки барбера", StateFilter(None))
-async def barber_status(message: Message, db: Database) -> None:
-    if not message.from_user:
+# ── Location ──────────────────────────────────────────────────────────────────
+
+@router.message(text_is(BTN["location"], "location", "location & map", "map"), NOT_TYPING)
+async def handle_location(message: Message, state: FSMContext) -> None:
+    """Show the barbershop location and a Google Maps button, cleaning previous menus."""
+    await send_menu_message(
+        message,
+        state,
+        MSG["location"].format(
+            shop=SHOP_NAME,
+            address=SHOP_ADDRESS,
+            hours=SHOP_HOURS,
+        ),
+        reply_markup=location_kb(),
+    )
+
+
+# ── Application Status (not yet barber) ──────────────────────────────────────
+
+@router.message(text_is(BTN["app_status"], "application status", "status"), NOT_TYPING)
+async def handle_app_status(message: Message, state: FSMContext) -> None:
+    """Show barber application status."""
+    await delete_previous_menu(message, state)
+    uid = message.from_user.id if message.from_user else 0
+    barber = await db.get_barber(uid)
+    if barber is None:
+        await message.answer(MSG["app_none"], parse_mode=ParseMode.HTML)
         return
-    barber = db.get_barber(message.from_user.id)
-    if not barber:
-        await message.answer("Вы ещё не подавали заявку. Нажмите «Стать барбером».")
-        return
-    status = {
-        "pending": "на рассмотрении у администратора",
-        "approved": "одобрена — откройте «Кабинет барбера»",
-        "rejected": "отклонена. Можно подать заявку снова",
-        "blocked": "аккаунт барбера заблокирован",
-    }.get(barber["status"], barber["status"])
-    await message.answer(f"Статус заявки барбера: {status}.")
+    status = barber["status"]
+    if status == "pending":
+        text = MSG["app_pending"]
+    elif status == "rejected":
+        text = MSG["app_rejected"]
+    elif status == "approved":
+        text = MSG["already_barber"]
+    else:
+        text = MSG["app_none"]
+    await message.answer(text, parse_mode=ParseMode.HTML)
 
+
+# ── Fallback (MUST BE REGISTERED LAST IN DISPATCHER) ──────────────────────────
 
 @fallback_router.message(StateFilter(None))
-async def fallback(message: Message, db: Database, admin_id: int) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-    await message.answer(
-        "Выберите действие в меню. /start — главное меню, /cancel — отмена сценария.",
-        reply_markup=main_keyboard(user_id, admin_id, db),
-    )
+async def fallback_no_state(message: Message) -> None:
+    """Catch-all for unrecognized messages outside any FSM state."""
+    await message.answer(MSG["unknown"])
 
 
 @fallback_router.message()
-async def fallback_busy(message: Message) -> None:
-    await message.answer("Сейчас нужно ответить на текущий шаг или нажать «Отмена».")
+async def fallback_in_state(message: Message) -> None:
+    """Text sent while a step expects a button press (e.g. choosing a service)."""
+    await message.answer(MSG["use_buttons"])
+
+
+@fallback_router.callback_query()
+async def fallback_callback(callback: CallbackQuery) -> None:
+    """Buttons of old menus: answer so the client's loading spinner stops."""
+    await safe_answer(callback, MSG["stale_button"])

@@ -1,483 +1,529 @@
-from aiogram import Bot, F, Router
-from aiogram.filters import StateFilter
+"""Booking flow handler — client-side booking and booking management."""
+from __future__ import annotations
+
+import datetime
+import logging
+
+from aiogram import F, Router
+from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, Message
 
-from db import Database
-from formatters import booking_card, draft_card
-from keyboards import (
-    barbers_keyboard,
-    bookings_keyboard,
-    cancel_keyboard,
-    client_booking_actions,
-    confirm_keyboard,
-    main_keyboard,
-    phone_keyboard,
-    services_keyboard,
+from app.db import db
+from app.formatters import format_booking_card
+from app.keyboards import (
+    barber_booking_actions_kb,
+    barbers_kb,
+    booking_confirm_kb,
+    cancel_kb,
+    client_booking_actions_kb,
+    dates_kb,
+    my_bookings_kb,
+    services_kb,
+    slots_kb,
 )
-from states import BookingFSM
-from utils import menu_markup, safe_send
+from app.states import BookingFSM
+from app.texts import BTN, MSG
+from app.utils import (
+    delete_message_safe,
+    delete_previous_menu,
+    parse_phone,
+    parse_text,
+    row_to_dict,
+    safe_answer,
+    send_main_menu,
+    send_menu_message,
+    text_is,
+    NOT_TYPING,
+)
 
-router = Router()
+__all__ = ["router"]
 
-
-async def ask_name(message: Message, state: FSMContext) -> None:
-    await state.set_state(BookingFSM.name)
-    await message.answer("Как к вам обращаться?", reply_markup=cancel_keyboard())
-
-
-async def ask_phone(message: Message, state: FSMContext) -> None:
-    await state.set_state(BookingFSM.phone)
-    await message.answer(
-        "Укажите номер телефона или нажмите «Отправить свой номер».",
-        reply_markup=phone_keyboard(),
-    )
-
-
-async def ask_service(target: Message, state: FSMContext, db: Database) -> None:
-    await state.set_state(BookingFSM.service)
-    await target.answer("Выберите услугу. Цены указаны в долларах.", reply_markup=ReplyKeyboardRemove())
-    await target.answer("Услуги студии:", reply_markup=services_keyboard(db.get_services()))
+logger = logging.getLogger(__name__)
+router = Router(name="booking")
 
 
-async def ask_barber(target: Message, state: FSMContext, db: Database) -> None:
-    barbers = db.approved_barbers()
-    if not barbers:
-        await target.answer("Пока нет доступных барберов. Попробуйте позже.")
-        return
-    await state.set_state(BookingFSM.barber)
-    lines = ["Выберите барбера. У каждого мастера свой рейтинг и ценовой сегмент:\n"]
-    for barber in barbers:
-        lines.append(
-            f"• {barber['name']} — {barber['rating']:.1f}/5, "
-            f"{barber['segment'].title()} ${barber['price_min']}–${barber['price_max']}"
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _booking_card(booking) -> str:
+    """Booking card with the barber's name filled in."""
+    barber = await db.get_barber(booking["barber_id"])
+    barber_name = barber["name"] if barber else "—"
+    return format_booking_card({**row_to_dict(booking), "barber_name": barber_name})
+
+
+async def _notify(callback_or_message, chat_id: int, text: str, **kwargs) -> None:
+    """Send a notification, logging (not raising) on failure."""
+    try:
+        await callback_or_message.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, **kwargs
         )
-    await target.answer("\n".join(lines), reply_markup=barbers_keyboard(barbers))
+    except Exception as e:
+        logger.warning("Could not notify %s: %s", chat_id, e)
 
 
-async def show_confirm(target: Message, state: FSMContext, db: Database) -> None:
+async def _own_pending_booking(user_id: int, booking_id: int):
+    """Return the booking if it belongs to the user and is still pending, else None."""
+    booking = await db.get_booking(booking_id)
+    if not booking or booking["client_id"] != user_id or booking["status"] != "pending":
+        return None
+    return booking
+
+
+async def _notify_barber_updated(event, booking_id: int) -> None:
+    booking = await db.get_booking(booking_id)
+    if booking:
+        await _notify(
+            event,
+            booking["barber_id"],
+            MSG["notify_barber_updated"].format(card=await _booking_card(booking)),
+        )
+
+
+async def _show_slots(callback: CallbackQuery, state: FSMContext, text: str) -> bool:
+    """Show free slots for the selected date. Returns False if none are left."""
     data = await state.get_data()
-    service = db.get_service(int(data["service_id"]))
-    barber = db.get_barber(int(data["barber_id"]))
-    if not service or not barber:
-        await target.answer("Не удалось собрать заявку. Начните запись заново.")
-        await state.clear()
-        return
-    price = db.service_price_for_barber(barber["user_id"], service["id"])
-    await state.update_data(price_usd=price)
-    await state.set_state(BookingFSM.confirm)
-    await target.answer(
-        draft_card(data, service["title"], barber, price),
-        reply_markup=confirm_keyboard(),
-    )
+    selected_date = datetime.date.fromisoformat(data["selected_date"])
+    available_slots = await db.get_free_slots(data["barber_id"], selected_date)
+    if not available_slots:
+        return False
+    await state.set_state(BookingFSM.time_slot)
+    await send_menu_message(callback, state, text, reply_markup=slots_kb(available_slots))
+    return True
 
 
-def after_edit_returns_to_confirm(data: dict) -> bool:
-    return bool(data.get("return_confirm")) and not data.get("booking_id")
+# ─────────────────────────────────────────────────────────────────────────────
+# START BOOKING FLOW
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-@router.message(F.text == "Записаться на услугу", StateFilter(None))
+@router.message(text_is(BTN["book"], "book an appointment", "book", "записаться"), NOT_TYPING)
 async def start_booking(message: Message, state: FSMContext) -> None:
+    """Begin the booking flow by asking for the client's name."""
+    await delete_previous_menu(message, state)
     await state.clear()
-    await state.update_data(return_confirm=False)
-    await ask_name(message, state)
+    await state.set_state(BookingFSM.name)
+    await message.answer(MSG["book_name"], parse_mode=ParseMode.HTML, reply_markup=cancel_kb())
 
 
 @router.message(BookingFSM.name)
-async def process_name(message: Message, state: FSMContext, db: Database, admin_id: int) -> None:
-    if not message.text:
-        await message.answer("Отправьте имя текстом.")
+async def booking_got_name(message: Message, state: FSMContext) -> None:
+    """Store name and ask for phone."""
+    name = parse_text(message, min_len=2, max_len=64)
+    if name is None:
+        await message.answer(MSG["invalid_name"])
         return
-    name = message.text.strip()
-    if len(name) < 2:
-        await message.answer("Имя слишком короткое.")
-        return
-
-    data = await state.get_data()
-    booking_id = data.get("booking_id")
-    if booking_id:
-        db.update_booking(int(booking_id), client_name=name)
-        await finish_existing_edit(message, state, db, admin_id, int(booking_id), "имя")
-        return
-
-    await state.update_data(name=name)
-    if after_edit_returns_to_confirm(data):
-        await show_confirm(message, state, db)
-        return
-    await ask_phone(message, state)
+    await state.update_data(client_name=name)
+    await state.set_state(BookingFSM.phone)
+    await message.answer(MSG["book_phone"], parse_mode=ParseMode.HTML, reply_markup=cancel_kb())
 
 
-@router.message(BookingFSM.phone, F.contact)
-async def process_phone_contact(
-    message: Message,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-) -> None:
-    contact = message.contact
-    if not contact or not contact.phone_number:
-        await message.answer("Не удалось получить номер.")
+@router.message(BookingFSM.phone)
+async def booking_got_phone(message: Message, state: FSMContext) -> None:
+    """Store phone and show service selection."""
+    phone = parse_phone(message)
+    if phone is None:
+        await message.answer(MSG["invalid_phone"])
         return
-    if contact.user_id and message.from_user and contact.user_id != message.from_user.id:
-        await message.answer("Отправьте именно свой номер.", reply_markup=phone_keyboard())
+    await state.update_data(client_phone=phone)
+    services = await db.get_services()
+    if not services:
+        await send_main_menu(message, state, text=MSG["error"])
         return
-    await save_phone(message, state, db, admin_id, contact.phone_number)
-
-
-@router.message(BookingFSM.phone, F.text)
-async def process_phone_text(
-    message: Message,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-) -> None:
-    phone = (message.text or "").strip()
-    digits = "".join(ch for ch in phone if ch.isdigit())
-    if len(digits) < 10:
-        await message.answer("Это не похоже на телефон.", reply_markup=phone_keyboard())
-        return
-    await save_phone(message, state, db, admin_id, phone)
-
-
-async def save_phone(
-    message: Message,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-    phone: str,
-) -> None:
-    data = await state.get_data()
-    booking_id = data.get("booking_id")
-    if booking_id:
-        db.update_booking(int(booking_id), phone=phone)
-        await finish_existing_edit(message, state, db, admin_id, int(booking_id), "телефон")
-        return
-
-    await state.update_data(phone=phone)
-    if after_edit_returns_to_confirm(data):
-        await message.answer("Телефон обновлён.", reply_markup=ReplyKeyboardRemove())
-        await show_confirm(message, state, db)
-        return
-    await ask_service(message, state, db)
+    await state.set_state(BookingFSM.service)
+    await send_menu_message(
+        message,
+        state,
+        MSG["book_service"],
+        reply_markup=services_kb(services),
+    )
 
 
 @router.callback_query(BookingFSM.service, F.data.startswith("svc:"))
-async def process_service(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-) -> None:
-    if not callback.message or not callback.data:
-        await callback.answer()
-        return
-    service_id = int(callback.data.split(":")[1])
-    service = db.get_service(service_id)
-    if not service:
-        await callback.answer("Услуга не найдена", show_alert=True)
-        return
-
+async def booking_got_service(callback: CallbackQuery, state: FSMContext) -> None:
+    """Store service and show barber selection (or update existing if editing)."""
+    _, svc_id, svc_name, svc_price = callback.data.split(":", 3)  # type: ignore[union-attr]
     data = await state.get_data()
-    booking_id = data.get("booking_id")
-    if booking_id:
-        booking = db.get_booking(int(booking_id))
+
+    if data.get("is_editing") and data.get("editing_booking_id"):
+        booking_id = int(data["editing_booking_id"])
+        booking = await _own_pending_booking(callback.from_user.id, booking_id)
         if not booking:
-            await callback.answer("Заявка не найдена", show_alert=True)
+            await safe_answer(callback, MSG["booking_not_editable"], show_alert=True)
+            await send_main_menu(callback, state, text=MSG["booking_not_editable"])
             return
-        price = db.service_price_for_barber(booking["barber_id"], service_id)
-        db.update_booking(int(booking_id), service_id=service_id, price_usd=price)
-        await notify_booking_changed(callback.bot, db, int(booking_id), "услугу")
-        await state.clear()
-        await callback.message.answer(
-            "Услуга в заявке обновлена.",
-            reply_markup=await menu_markup(callback, db, admin_id),
-        )
-        await callback.answer("Сохранено")
+        await safe_answer(callback)
+        price = await db.get_effective_price(booking["barber_id"], int(svc_id))
+        await db.update_booking_field(booking_id, "service_id", int(svc_id))
+        await db.update_booking_field(booking_id, "service_name", svc_name)
+        await db.update_booking_field(booking_id, "price", price if price is not None else float(svc_price))
+        await _notify_barber_updated(callback, booking_id)
+        await send_main_menu(callback, state, text=MSG["updated_ok"])
         return
 
-    await state.update_data(service_id=service_id)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    if after_edit_returns_to_confirm(data) and data.get("barber_id"):
-        await show_confirm(callback.message, state, db)
-        await callback.answer()
+    await safe_answer(callback)
+    await state.update_data(
+        service_id=int(svc_id),
+        service_name=svc_name,
+        service_price=float(svc_price),
+    )
+    barbers = await db.get_approved_barbers()
+    if not barbers:
+        await send_main_menu(callback, state, text=MSG["book_no_barbers"])
         return
-    await ask_barber(callback.message, state, db)
-    await callback.answer()
+    await state.set_state(BookingFSM.barber)
+    await send_menu_message(
+        callback,
+        state,
+        MSG["book_barber"],
+        reply_markup=barbers_kb(barbers),
+    )
 
 
-@router.callback_query(BookingFSM.barber, F.data.startswith("brb:"))
-async def process_barber(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-) -> None:
-    if not callback.message or not callback.data:
-        await callback.answer()
-        return
-    barber_id = int(callback.data.split(":")[1])
-    barber = db.get_barber(barber_id)
+@router.callback_query(BookingFSM.barber, F.data.startswith("pick_barber:"))
+async def booking_got_barber(callback: CallbackQuery, state: FSMContext) -> None:
+    """Store barber and show date selection (or update existing if editing)."""
+    barber_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    barber = await db.get_barber(barber_id)
     if not barber or barber["status"] != "approved":
-        await callback.answer("Этот барбер недоступен", show_alert=True)
+        await safe_answer(callback)
+        await send_main_menu(callback, state, text=MSG["error"])
         return
 
     data = await state.get_data()
-    booking_id = data.get("booking_id")
-    if booking_id:
-        booking = db.get_booking(int(booking_id))
+    if data.get("is_editing") and data.get("editing_booking_id"):
+        booking_id = int(data["editing_booking_id"])
+        booking = await _own_pending_booking(callback.from_user.id, booking_id)
         if not booking:
-            await callback.answer("Заявка не найдена", show_alert=True)
+            await safe_answer(callback, MSG["booking_not_editable"], show_alert=True)
+            await send_main_menu(callback, state, text=MSG["booking_not_editable"])
             return
         old_barber_id = booking["barber_id"]
-        price = db.service_price_for_barber(barber_id, booking["service_id"])
-        db.update_booking(int(booking_id), barber_id=barber_id, price_usd=price)
-        updated = db.get_booking(int(booking_id))
-        if updated and old_barber_id != barber_id:
-            await safe_send(
-                callback.bot,
-                old_barber_id,
-                f"Клиент перенёс заявку #{booking_id} к другому мастеру.",
-            )
-            await safe_send(
-                callback.bot,
-                barber_id,
-                "Вам передали заявку:\n\n" + booking_card(updated),
-            )
-        await callback.message.answer(
-            "Барбер в заявке обновлён.",
-            reply_markup=await menu_markup(callback, db, admin_id),
+        if barber_id == old_barber_id:
+            await safe_answer(callback)
+            await send_main_menu(callback, state, text=MSG["updated_ok"])
+            return
+        # The new barber must work at the booked time and have that slot free
+        slot = booking["slot_datetime"]
+        if slot:
+            date_str, slot_time = slot.split(" ")
+            free = await db.get_free_slots(barber_id, datetime.date.fromisoformat(date_str))
+            if slot_time not in free:
+                await safe_answer(callback, MSG["barber_unavailable"], show_alert=True)
+                return
+        price = await db.get_effective_price(barber_id, booking["service_id"])
+        if not await db.reassign_booking(booking_id, barber_id, price):
+            await safe_answer(callback, MSG["barber_unavailable"], show_alert=True)
+            return
+        await safe_answer(callback)
+        await _notify(callback, old_barber_id, MSG["notify_barber_reassigned"].format(id=booking_id))
+        updated = await db.get_booking(booking_id)
+        await _notify(
+            callback,
+            barber_id,
+            MSG["notify_barber_new_booking"].format(card=await _booking_card(updated)),
+            reply_markup=barber_booking_actions_kb(booking_id, "pending", with_back=False),
         )
-        await state.clear()
-        await callback.answer("Сохранено")
+        await send_main_menu(callback, state, text=MSG["updated_ok"])
         return
 
-    await state.update_data(barber_id=barber_id)
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await show_confirm(callback.message, state, db)
-    await callback.answer()
+    await safe_answer(callback)
+    # Barber-specific price overrides the studio price
+    price = await db.get_effective_price(barber_id, int(data["service_id"]))
+    await state.update_data(
+        barber_id=barber_id,
+        barber_name=barber["name"],
+        service_price=price if price is not None else data.get("service_price", 0.0),
+    )
 
+    # Only dates that still have at least one free slot
+    available_dates = await db.get_available_dates(barber_id, days_ahead=14)
+    if not available_dates:
+        await send_main_menu(callback, state, text=MSG["book_no_dates"])
+        return
 
-@router.message(BookingFSM.service)
-async def service_text(message: Message, db: Database) -> None:
-    await message.answer(
-        "Выберите услугу кнопкой ниже.",
-        reply_markup=services_keyboard(db.get_services()),
+    await state.set_state(BookingFSM.date)
+    await send_menu_message(
+        callback,
+        state,
+        MSG["book_date"],
+        reply_markup=dates_kb(available_dates),
     )
 
 
-@router.message(BookingFSM.barber)
-async def barber_text(message: Message, db: Database) -> None:
-    await message.answer(
-        "Выберите барбера кнопкой ниже.",
-        reply_markup=barbers_keyboard(db.approved_barbers()),
+@router.callback_query(BookingFSM.date, F.data.startswith("date:"))
+async def booking_got_date(callback: CallbackQuery, state: FSMContext) -> None:
+    """Store selected date and show time slot selection."""
+    await safe_answer(callback)
+    date_str = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
+    await state.update_data(selected_date=date_str)
+    if not await _show_slots(callback, state, MSG["book_slot"]):
+        await send_main_menu(callback, state, text=MSG["book_no_slots"])
+
+
+@router.callback_query(BookingFSM.time_slot, F.data.startswith("slot:"))
+async def booking_got_slot(callback: CallbackQuery, state: FSMContext) -> None:
+    """Store selected time slot and show confirmation card."""
+    await safe_answer(callback)
+    slot_time = callback.data.split(":", 1)[1]  # type: ignore[union-attr]
+    data = await state.get_data()
+    slot_datetime = f"{data['selected_date']} {slot_time}"
+
+    if await db.is_slot_taken(data["barber_id"], slot_datetime):
+        if not await _show_slots(callback, state, MSG["slot_taken"]):
+            await send_main_menu(callback, state, text=MSG["book_no_slots"])
+        return
+
+    await state.update_data(slot_time=slot_time, slot_datetime=slot_datetime)
+
+    # Re-fetch barber name in case it changed
+    barber = await db.get_barber(data["barber_id"])
+    barber_name = barber["name"] if barber else data.get("barber_name", "—")
+
+    card = format_booking_card({
+        "id": "—",
+        "client_name": data.get("client_name", "—"),
+        "client_phone": data.get("client_phone", "—"),
+        "service_name": data.get("service_name", "—"),
+        "barber_name": barber_name,
+        "price": data.get("service_price", 0),
+        "status": "pending",
+        "slot_datetime": slot_datetime,
+    })
+
+    await state.set_state(BookingFSM.confirm)
+    await send_menu_message(
+        callback,
+        state,
+        f"{MSG['book_confirm']}\n\n{card}",
+        reply_markup=booking_confirm_kb(),
     )
 
 
-@router.callback_query(BookingFSM.confirm, F.data == "bk:ok")
-async def confirm_booking(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-    bot: Bot,
-) -> None:
-    if not callback.message or not callback.from_user:
-        await callback.answer()
+@router.callback_query(BookingFSM.confirm, F.data == "book_confirm")
+async def booking_confirmed(callback: CallbackQuery, state: FSMContext) -> None:
+    """Save the booking to the database and notify the barber."""
+    await safe_answer(callback)
+    data = await state.get_data()
+    # Leave the confirm state right away so a double tap cannot create two bookings
+    await state.set_state(None)
+
+    barber = await db.get_barber(data["barber_id"])
+    if not barber or barber["status"] != "approved":
+        await send_main_menu(callback, state, text=MSG["book_no_barbers"])
+        return
+
+    if await db.is_slot_taken(data["barber_id"], data["slot_datetime"]):
+        await state.set_data(data)
+        if not await _show_slots(callback, state, MSG["slot_taken"]):
+            await send_main_menu(callback, state, text=MSG["book_no_slots"])
+        return
+
+    booking_id = await db.create_booking(
+        client_id=callback.from_user.id,  # type: ignore[union-attr]
+        barber_id=data["barber_id"],
+        client_name=data["client_name"],
+        client_phone=data["client_phone"],
+        service_name=data["service_name"],
+        price=data.get("service_price", 0.0),
+        slot_datetime=data["slot_datetime"],
+        service_id=data.get("service_id"),
+    )
+    if booking_id is None:
+        # Another client took the slot between the check and the insert
+        await state.set_data(data)
+        if not await _show_slots(callback, state, MSG["slot_taken"]):
+            await send_main_menu(callback, state, text=MSG["book_no_slots"])
+        return
+
+    booking = await db.get_booking(booking_id)
+    card = await _booking_card(booking)
+    await _notify(
+        callback,
+        data["barber_id"],
+        MSG["notify_barber_new_booking"].format(card=card),
+        reply_markup=barber_booking_actions_kb(booking_id, "pending", with_back=False),
+    )
+
+    await send_main_menu(callback, state, text=MSG["book_ok"])
+
+
+@router.callback_query(BookingFSM.confirm, F.data == "book_cancel")
+async def booking_cancelled_at_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    """Cancel booking at the confirm step."""
+    await safe_answer(callback)
+    await send_main_menu(callback, state, text=MSG["cancelled"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MY BOOKINGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.message(text_is(BTN["my_bookings"], "my bookings", "bookings", "мои заявки"), NOT_TYPING)
+async def handle_my_bookings(message: Message, state: FSMContext) -> None:
+    """Show a list of the client's own bookings."""
+    await delete_previous_menu(message, state)
+    await state.clear()
+    uid = message.from_user.id if message.from_user else 0
+    bookings = await db.get_client_bookings(uid)
+    if not bookings:
+        await message.answer(MSG["my_bookings_empty"], parse_mode=ParseMode.HTML)
+        return
+    await send_menu_message(
+        message,
+        state,
+        MSG["my_bookings_list"],
+        reply_markup=my_bookings_kb(bookings),
+    )
+
+
+@router.callback_query(F.data.startswith("mybk:"))
+async def view_my_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    """Show details for one of the client's bookings."""
+    await safe_answer(callback)
+    booking_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    booking = await db.get_booking(booking_id)
+    if not booking or booking["client_id"] != callback.from_user.id:
+        await send_main_menu(callback, state, text=MSG["error"])
+        return
+
+    card = await _booking_card(booking)
+    is_pending = booking["status"] == "pending"
+
+    await send_menu_message(
+        callback,
+        state,
+        card,
+        reply_markup=client_booking_actions_kb(booking_id, is_pending),
+    )
+
+
+@router.callback_query(F.data == "mybk_back")
+async def my_bookings_back(callback: CallbackQuery, state: FSMContext) -> None:
+    """Go back to the My Bookings list."""
+    await safe_answer(callback)
+    uid = callback.from_user.id if callback.from_user else 0
+    bookings = await db.get_client_bookings(uid)
+    if not bookings:
+        await send_main_menu(callback, state, text=MSG["my_bookings_empty"])
+        return
+    await send_menu_message(
+        callback,
+        state,
+        MSG["my_bookings_list"],
+        reply_markup=my_bookings_kb(bookings),
+    )
+
+
+# ── Client booking edits ──────────────────────────────────────────────────────
+
+async def _start_client_edit(callback: CallbackQuery, state: FSMContext) -> int | None:
+    """Validate a client edit button; returns the booking id or None (already answered)."""
+    booking_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    if not await _own_pending_booking(callback.from_user.id, booking_id):
+        await safe_answer(callback, MSG["booking_not_editable"], show_alert=True)
+        await delete_message_safe(callback.message)
+        return None
+    await safe_answer(callback)
+    await state.clear()
+    await state.update_data(editing_booking_id=booking_id)
+    return booking_id
+
+
+@router.callback_query(F.data.startswith("cbk_edit_name:"))
+async def client_edit_name_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _start_client_edit(callback, state) is None:
+        return
+    await state.set_state(BookingFSM.edit_name)
+    await delete_message_safe(callback.message)
+    await callback.message.answer(MSG["enter_new_name"], parse_mode=ParseMode.HTML, reply_markup=cancel_kb())  # type: ignore[union-attr]
+
+
+@router.message(BookingFSM.edit_name)
+async def client_edit_name_done(message: Message, state: FSMContext) -> None:
+    name = parse_text(message, min_len=2, max_len=64)
+    if name is None:
+        await message.answer(MSG["invalid_name"])
         return
     data = await state.get_data()
-    required = ("name", "phone", "service_id", "barber_id")
-    if any(key not in data for key in required):
-        await callback.answer("Данные неполные, начните запись заново", show_alert=True)
-        await state.clear()
+    booking_id: int = data["editing_booking_id"]
+    if not await _own_pending_booking(message.from_user.id, booking_id):  # type: ignore[union-attr]
+        await send_main_menu(message, state, text=MSG["booking_not_editable"])
         return
-
-    barber_id = int(data["barber_id"])
-    service_id = int(data["service_id"])
-    price = db.service_price_for_barber(barber_id, service_id)
-    booking_id = db.create_booking(
-        client_id=callback.from_user.id,
-        barber_id=barber_id,
-        service_id=service_id,
-        client_name=data["name"],
-        phone=data["phone"],
-        price_usd=price,
-    )
-    booking = db.get_booking(booking_id)
-    await state.clear()
-
-    if booking:
-        sent = await safe_send(
-            bot,
-            barber_id,
-            "Новая заявка от клиента:\n\n" + booking_card(booking),
-        )
-        if not sent and barber_id != admin_id:
-            await safe_send(bot, admin_id, "Барбер не получил заявку:\n\n" + booking_card(booking))
-
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer(
-            "Заявка отправлена выбранному барберу.\n\n" + booking_card(booking)
-            + "\n\nПока мастер не подтвердил запись, её можно изменить в разделе «Мои заявки».",
-            reply_markup=await menu_markup(callback, db, admin_id),
-        )
-    await callback.answer("Отправлено")
+    await db.update_booking_field(booking_id, "client_name", name)
+    await _notify_barber_updated(message, booking_id)
+    await send_main_menu(message, state, text=MSG["updated_ok"])
 
 
-@router.callback_query(BookingFSM.confirm, F.data == "bk:ed:name")
-async def edit_name(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(return_confirm=True)
-    if callback.message:
-        await ask_name(callback.message, state)
-    await callback.answer()
-
-
-@router.callback_query(BookingFSM.confirm, F.data == "bk:ed:phone")
-async def edit_phone(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(return_confirm=True)
-    if callback.message:
-        await ask_phone(callback.message, state)
-    await callback.answer()
-
-
-@router.callback_query(BookingFSM.confirm, F.data == "bk:ed:svc")
-async def edit_service(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    await state.update_data(return_confirm=True)
-    if callback.message:
-        await ask_service(callback.message, state, db)
-    await callback.answer()
-
-
-@router.callback_query(BookingFSM.confirm, F.data == "bk:ed:brb")
-async def edit_barber(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    await state.update_data(return_confirm=True)
-    if callback.message:
-        await ask_barber(callback.message, state, db)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "bk:cancel")
-async def cancel_draft(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-) -> None:
-    await state.clear()
-    if callback.message:
-        await callback.message.answer(
-            "Черновик записи отменён.",
-            reply_markup=await menu_markup(callback, db, admin_id),
-        )
-    await callback.answer()
-
-
-@router.message(F.text == "Мои заявки", StateFilter(None))
-async def my_bookings(message: Message, db: Database) -> None:
-    if not message.from_user:
+@router.callback_query(F.data.startswith("cbk_edit_phone:"))
+async def client_edit_phone_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _start_client_edit(callback, state) is None:
         return
-    items = db.client_bookings(message.from_user.id)
-    if not items:
-        await message.answer("У вас пока нет заявок.")
-        return
-    await message.answer("Ваши заявки. Нажмите, чтобы открыть и отредактировать:")
-    await message.answer("Список:", reply_markup=bookings_keyboard(items, "cbk"))
+    await state.set_state(BookingFSM.edit_phone)
+    await delete_message_safe(callback.message)
+    await callback.message.answer(MSG["enter_new_phone"], parse_mode=ParseMode.HTML, reply_markup=cancel_kb())  # type: ignore[union-attr]
 
 
-@router.callback_query(F.data.startswith("cbk:"))
-async def open_client_booking(callback: CallbackQuery, db: Database) -> None:
-    if not callback.data or not callback.from_user:
-        await callback.answer()
+@router.message(BookingFSM.edit_phone)
+async def client_edit_phone_done(message: Message, state: FSMContext) -> None:
+    phone = parse_phone(message)
+    if phone is None:
+        await message.answer(MSG["invalid_phone"])
         return
-    booking_id = int(callback.data.split(":")[1])
-    booking = db.get_booking(booking_id)
-    if not booking or booking["client_id"] != callback.from_user.id:
-        await callback.answer("Заявка не найдена", show_alert=True)
+    data = await state.get_data()
+    booking_id: int = data["editing_booking_id"]
+    if not await _own_pending_booking(message.from_user.id, booking_id):  # type: ignore[union-attr]
+        await send_main_menu(message, state, text=MSG["booking_not_editable"])
         return
-    if callback.message:
-        await callback.message.answer(
-            booking_card(booking),
-            reply_markup=client_booking_actions(booking_id, booking["status"]),
-        )
-    await callback.answer()
+    await db.update_booking_field(booking_id, "client_phone", phone)
+    await _notify_barber_updated(message, booking_id)
+    await send_main_menu(message, state, text=MSG["updated_ok"])
 
 
-@router.callback_query(F.data.startswith("ced:"))
-async def edit_existing(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    if not callback.data or not callback.from_user or not callback.message:
-        await callback.answer()
+@router.callback_query(F.data.startswith("cbk_change_svc:"))
+async def client_change_service(callback: CallbackQuery, state: FSMContext) -> None:
+    """Let a client change the service on a pending booking."""
+    if await _start_client_edit(callback, state) is None:
         return
-    _, booking_id_raw, field = callback.data.split(":")
-    booking_id = int(booking_id_raw)
-    booking = db.get_booking(booking_id)
-    if not booking or booking["client_id"] != callback.from_user.id:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if booking["status"] != "pending":
-        await callback.answer("Эту заявку уже нельзя менять", show_alert=True)
-        return
-
-    await state.clear()
-    await state.update_data(booking_id=booking_id, return_confirm=False)
-    if field == "name":
-        await ask_name(callback.message, state)
-    elif field == "phone":
-        await ask_phone(callback.message, state)
-    elif field == "svc":
-        await ask_service(callback.message, state, db)
-    elif field == "brb":
-        await ask_barber(callback.message, state, db)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ccl:"))
-async def cancel_existing(
-    callback: CallbackQuery,
-    db: Database,
-    admin_id: int,
-) -> None:
-    if not callback.data or not callback.from_user:
-        await callback.answer()
-        return
-    booking_id = int(callback.data.split(":")[1])
-    booking = db.get_booking(booking_id)
-    if not booking or booking["client_id"] != callback.from_user.id:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    if booking["status"] != "pending":
-        await callback.answer("Заявку уже нельзя отменить", show_alert=True)
-        return
-    db.update_booking(booking_id, status="cancelled")
-    await safe_send(callback.bot, booking["barber_id"], f"Клиент отменил заявку #{booking_id}.")
-    if callback.message:
-        await callback.message.answer(
-            "Заявка отменена.",
-            reply_markup=await menu_markup(callback, db, admin_id),
-        )
-    await callback.answer("Отменено")
-
-
-async def finish_existing_edit(
-    message: Message,
-    state: FSMContext,
-    db: Database,
-    admin_id: int,
-    booking_id: int,
-    field_name: str,
-) -> None:
-    await notify_booking_changed(message.bot, db, booking_id, field_name)
-    await state.clear()
-    await message.answer(
-        f"Поле «{field_name}» обновлено.",
-        reply_markup=main_keyboard(message.from_user.id if message.from_user else 0, admin_id, db),
+    services = await db.get_services()
+    await state.set_state(BookingFSM.service)
+    await state.update_data(is_editing=True)
+    await send_menu_message(
+        callback,
+        state,
+        MSG["book_service"],
+        reply_markup=services_kb(services),
     )
 
 
-async def notify_booking_changed(bot: Bot, db: Database, booking_id: int, field_name: str) -> None:
-    booking = db.get_booking(booking_id)
+@router.callback_query(F.data.startswith("cbk_change_barber:"))
+async def client_change_barber(callback: CallbackQuery, state: FSMContext) -> None:
+    """Let a client change the barber on a pending booking."""
+    if await _start_client_edit(callback, state) is None:
+        return
+    barbers = await db.get_approved_barbers()
+    if not barbers:
+        await send_main_menu(callback, state, text=MSG["book_no_barbers"])
+        return
+    await state.set_state(BookingFSM.barber)
+    await state.update_data(is_editing=True)
+    await send_menu_message(
+        callback,
+        state,
+        MSG["book_barber"],
+        reply_markup=barbers_kb(barbers),
+    )
+
+
+@router.callback_query(F.data.startswith("cbk_cancel:"))
+async def client_cancel_booking(callback: CallbackQuery, state: FSMContext) -> None:
+    """Cancel a client's pending booking."""
+    booking_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    booking = await _own_pending_booking(callback.from_user.id, booking_id)
     if not booking:
+        await safe_answer(callback, MSG["booking_not_editable"], show_alert=True)
+        await delete_message_safe(callback.message)
         return
-    await safe_send(
-        bot,
-        booking["barber_id"],
-        f"Клиент изменил {field_name} в заявке:\n\n" + booking_card(booking),
-    )
+    await safe_answer(callback)
+    await db.update_booking_status(booking_id, "cancelled")
+    await _notify(callback, booking["barber_id"], MSG["notify_barber_cancelled"].format(id=booking_id))
+    await send_main_menu(callback, state, text=MSG["booking_cancelled_ok"])
